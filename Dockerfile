@@ -7,6 +7,7 @@ RUN set -ex \
         boto3==1.4.4
 
 # ecs deployer script
+ENV PYTHONUNBUFFERED 1
 COPY ecs_deployer.py /usr/local/bin/ecs_deployer.py
 
 # entrypoint / cmd
