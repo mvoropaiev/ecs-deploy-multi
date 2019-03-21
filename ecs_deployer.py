@@ -1,18 +1,20 @@
 #! /usr/bin/env python3
 import argparse
 import configparser
+import hashlib
+import json
 import os
 import sys
 import time
 from copy import deepcopy
-from botocore.exceptions import ClientError
+
 import boto3
+from botocore.exceptions import ClientError
 
 
 def parse_arguments(arguments):
     parser = argparse.ArgumentParser(
-        description='Deploy service with one or more tasks'
-    )
+        description='Deploy service with one or more tasks')
     parser.add_argument('-r', '--region')
     parser.add_argument('-p', '--profile', default=None)
     parser.add_argument('-c', '--cluster', default='default')
@@ -23,8 +25,11 @@ def parse_arguments(arguments):
     parser.add_argument('-i', '--image', nargs=2, action='append')
     parser.add_argument('-t', '--timeout', default=90, type=int)
     parser.add_argument('-b', '--backoff', default=5, type=int)
-    parser.add_argument('-O', '--only-if-modified', action='store_true',
-                        dest='onlyIfModified')
+    parser.add_argument('--code-deploy', action='store_true')
+    parser.add_argument('-a', '--app-name')
+    parser.add_argument('-g', '--group-name')
+    parser.add_argument(
+        '-O', '--only-if-modified', action='store_true', dest='onlyIfModified')
 
     return parser.parse_args(arguments)
 
@@ -67,14 +72,14 @@ def wait_for_task(ecs, cluster, service, new_task_def_arn, timeout, backoff):
     while True:
         time.sleep(backoff)
 
-        result = ecs.list_tasks(cluster=cluster, serviceName=service,
-                                desiredStatus='RUNNING')
+        result = ecs.list_tasks(
+            cluster=cluster, serviceName=service, desiredStatus='RUNNING')
         wait_text = 'New task is not running yet'
 
         if result and 'taskArns' in result:
             try:
-                tasks = ecs.describe_tasks(cluster=cluster,
-                                           tasks=result['taskArns'])
+                tasks = ecs.describe_tasks(
+                    cluster=cluster, tasks=result['taskArns'])
                 if tasks and 'tasks' in tasks:
                     has_updated = [
                         x for x in tasks['tasks']
@@ -95,8 +100,56 @@ def wait_for_task(ecs, cluster, service, new_task_def_arn, timeout, backoff):
         print(wait_text + ', backing off for {} seconds.'.format(backoff))
 
 
+def get_codedeploy_data(task_definition):
+    container_names = []
+    container_ports = []
+    for container_def in task_definition:
+        try:
+            container_ports.append(
+                container_def['portMappings'][0]['containerPort'])
+            container_names.append(container_def['name'])
+        except (IndexError, KeyError):
+            continue
+
+    if len(container_ports) > 1:
+        print('Does not support container definitions with multiple ' \
+              'portMappings blocks at the momemnt...')
+        sys.exit(1)
+    elif not container_ports:
+        print('Unable to find container definition with portMappings block.')
+        sys.exit(1)
+
+    return container_names[0], container_ports[0]
+
+
+def get_app_spec_content(task_definition, container_name, container_port):
+    data = {
+        'version':
+        1,
+        'Resources': [{
+            'TargetService': {
+                'Type': 'AWS::ECS::Service',
+                'Properties': {
+                    'TaskDefinition': task_definition,
+                    'LoadBalancerInfo': {
+                        'ContainerName': container_name,
+                        'ContainerPort': container_port
+                    }
+                }
+            }
+        }]
+    }
+    return json.dumps(data)
+
+
 def main():
     args = parse_arguments(sys.argv[1:])
+
+    if args.code_deploy and (not args.app_name or not args.group_name):
+        print('You need to specifiy application name with -a (--app-name) ' \
+              'and deployment group name with -g (--group-name) when using ' \
+              '-d (--code-deploy) option.')
+        sys.exit(1)
 
     region = args.region if args.region else get_aws_region(args.profile)
     if not region:
@@ -134,8 +187,7 @@ def main():
         images = []
         result = ecs.describe_services(cluster=cluster, services=(args.copy, ))
         task = ecs.describe_task_definition(
-            taskDefinition=result['services'][0]['taskDefinition']
-        )
+            taskDefinition=result['services'][0]['taskDefinition'])
         for container in task['taskDefinition']['containerDefinitions']:
             images.append((container["name"], container["image"]))
         if len(images) > 0:
@@ -151,15 +203,16 @@ def main():
         family=task['taskDefinition']['family'],
         volumes=deepcopy(task['taskDefinition']['volumes']),
         containerDefinitions=deepcopy(
-            task['taskDefinition']['containerDefinitions']
-        ),
+            task['taskDefinition']['containerDefinitions']),
     )
 
     has_update = False
     if images:
         for image in images:
-            container = [x for x in new_task_def["containerDefinitions"]
-                         if x["name"] == image[0]]
+            container = [
+                x for x in new_task_def["containerDefinitions"]
+                if x["name"] == image[0]
+            ]
             if container and container[0]["image"] != image[1]:
                 has_update = True
                 container[0]["image"] = image[1]
@@ -177,12 +230,37 @@ def main():
         print("Successfully updated task definition.")
         sys.exit(0)
     else:
-        ecs.update_service(cluster=cluster, service=service,
-                           taskDefinition=new_task_def_arn)
+        if args.code_deploy:
+            deploy = session.client('codedeploy')
+
+            container_name, container_port = get_codedeploy_data(
+                task['taskDefinition']['containerDefinitions'])
+            app_spec_contnet = get_app_spec_content(
+                task_definition=new_task_def_arn,
+                container_name=container_name,
+                container_port=container_port)
+            deploy.create_deployment(
+                applicationName=args.app_name,
+                deploymentGroupName=args.group_name,
+                revision={
+                    'revisionType': 'AppSpecContent',
+                    'appSpecContent': {
+                        'content':
+                        app_spec_contnet,
+                        'sha256':
+                        hashlib.sha256(
+                            app_spec_contnet.encode('utf-8')).hexdigest()
+                    }
+                })
+        else:
+            ecs.update_service(
+                cluster=cluster,
+                service=service,
+                taskDefinition=new_task_def_arn)
 
     # wait for task to be running
-    if wait_for_task(ecs, cluster, service, new_task_def_arn,
-                     args.timeout, args.backoff):
+    if wait_for_task(ecs, cluster, service, new_task_def_arn, args.timeout,
+                     args.backoff):
         print('Service updated successfully, new task definition is running.')
         sys.exit(0)
     else:
