@@ -4,7 +4,7 @@ FROM python:3-alpine
 # requirements
 RUN set -ex \
     && pip install --no-cache-dir \
-        boto3==1.5.22
+        boto3==1.9.118
 
 # ecs deployer script
 ENV PYTHONUNBUFFERED 1
